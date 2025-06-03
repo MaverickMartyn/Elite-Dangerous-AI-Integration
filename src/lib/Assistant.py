@@ -10,7 +10,7 @@ from .ActionManager import ActionManager
 from .PromptGenerator import PromptGenerator
 from .TTS import TTS
 from .EDCoPilot import EDCoPilot
-from openai import OpenAI, RateLimitError
+from openai import BadRequestError, OpenAI, RateLimitError
 from typing import Any,  Callable, final
 from threading import Thread
 
@@ -142,6 +142,11 @@ class Assistant:
                     #   .get('retryDelay') - /.+s/
                     
                     return
+                except BadRequestError as e:
+                    log("error", "LLM Bad Request (400) error:", e)
+                    log("error", "Parameter:", e.param)
+                    log("error", "Message:", e.message)
+                    log("error", "Body:", e.body)
                 
                 if response.status_code < 200 or response.status_code >= 300:
                     log("error", "LLM api error request:", response.http_request.method, response.http_request.url, response.http_request.headers, response.http_request.content.decode('utf-8', errors='replace'))
