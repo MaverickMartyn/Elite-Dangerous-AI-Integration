@@ -379,6 +379,8 @@ class Config(TypedDict):
     tools_var: bool
     vision_var: bool
     ptt_var: bool
+    ptt_tap_to_talk_var: bool
+    ptt_inverted_var: bool
     mute_during_response_var: bool
     game_actions_var: bool
     web_search_actions_var: bool
@@ -386,8 +388,6 @@ class Config(TypedDict):
     edcopilot: bool
     edcopilot_dominant: bool
     ptt_key: str
-    ptm_key: str
-    ptm_toggle_var: bool
     input_device_name: str
     output_device_name: str
     cn_autostart: bool
@@ -651,6 +651,8 @@ def load_config() -> Config:
         'tools_var': True,
         'vision_var': False,
         'ptt_var': False,
+        'ptt_tap_to_talk_var': False,
+        'ptt_inverted_var': False,
         'mute_during_response_var': False,
         'event_reaction_enabled_var': True,
         'game_actions_var': True,
@@ -666,8 +668,6 @@ def load_config() -> Config:
         'llm_endpoint': "https://api.openai.com/v1",
         'llm_api_key': "",
         'ptt_key': '',
-        'ptm_key': '',
-        'ptm_toggle_var': False,
         'vision_provider': "none",
         'vision_model_name': "gpt-4.1-mini",
         'vision_endpoint': "https://api.openai.com/v1",
@@ -746,21 +746,6 @@ def assign_ptt(config: Config, controller_manager):
     def on_hotkey_detected(key: str):
         # print(f"Received key: {key}")
         config["ptt_key"] = key
-        semaphore.release()
-
-    semaphore.acquire()
-    controller_manager.listen_hotkey(on_hotkey_detected)
-    semaphore.acquire()
-    print(json.dumps({"type": "config", "config": config}) + '\n')
-    save_config(config)
-    return config
-
-def assign_ptm(config: Config, controller_manager):
-    semaphore = Semaphore(1)
-
-    def on_hotkey_detected(key: str):
-        # print(f"Received key: {key}")
-        config["ptm_key"] = key
         semaphore.release()
 
     semaphore.acquire()
