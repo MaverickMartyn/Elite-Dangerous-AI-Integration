@@ -1,6 +1,12 @@
 import sys
-from time import time
+from time import time, sleep # Modified import
 from typing import Any, final
+import os # Added import
+import threading # Added import
+import json # Added import
+import io # Added import
+import traceback # Added import
+import platform # Added import
 
 from EDMesg.CovasNext import ExternalChatNotification, ExternalBackgroundChatNotification
 from openai import OpenAI
@@ -93,7 +99,7 @@ class Chat:
                 api_key=self.config["api_key"] if self.config["tts_api_key"] == '' else self.config["tts_api_key"],
             )
             
-        tts_provider = 'none' if self.config["edcopilot_dominant"] else self.config["tts_provider"]
+        tts_provider = 'none' if self.config["edcopilot"] and self.config["edcopilot_dominant"] else self.config["tts_provider"]
         self.tts = TTS(openai_client=self.ttsClient, provider=tts_provider, model=self.config["tts_model_name"], voice=self.character["tts_voice"], voice_instructions=self.character["tts_prompt"], speed=self.character["tts_speed"], output_device=self.config["output_device_name"])
         self.stt = STT(openai_client=self.sttClient, provider=self.config["stt_provider"], input_device_name=self.config["input_device_name"], model=self.config["stt_model_name"], custom_prompt=self.config["stt_custom_prompt"], required_word=self.config["stt_required_word"])
 
@@ -113,7 +119,6 @@ class Chat:
         self.event_manager = EventManager(
             game_events=self.enabled_game_events,
             plugin_event_classes=plugin_event_classes,
-            continue_conversation=self.config["continue_conversation_var"],
         )
 
         log("debug", message="Initializing assistant...")
@@ -177,7 +182,7 @@ class Chat:
         # TTS Setup
         log('info', "Basic configuration complete.")
         log('info', "Loading voice output...")
-        if self.config["edcopilot_dominant"]:
+        if self.config["edcopilot"] and self.config["edcopilot_dominant"]:
             log('info', "EDCoPilot is dominant, voice output will be handled by EDCoPilot.")
 
         if self.config['ptt_var'] and self.config['ptt_key']:
@@ -212,12 +217,10 @@ class Chat:
 
         if self.config['tools_var']:
             register_actions(self.action_manager, self.event_manager, self.llmClient, self.config["llm_model_name"], self.visionClient, self.config["vision_model_name"], self.ed_keys)
+
             log('info', "Built-in Actions ready.")
             self.plugin_manager.register_actions(self.plugin_helper)
             log('info', "Plugin provided Actions ready.")
-        
-        if not self.config["continue_conversation_var"]:
-            self.action_manager.reset_action_cache()
             
         log('info', 'Initializing states...')
         while self.jn.historic_events:
@@ -307,6 +310,16 @@ def read_stdin(chat: Chat):
             if data.get("type") == "submit_input":
                 chat.submit_input(data["input"])
 
+def check_zombie_status():
+    """Checks if the current process is a zombie and exits if it is."""
+    log("debug", "Starting zombie process checker thread...")
+    while True:
+        if os.getppid() == 1:
+            log("info", "Parent process exited. Exiting.")
+            sleep(1)  # Give some time for the parent to exit
+            os._exit(0)  # Use os._exit to avoid cleanup issues in threads
+        sleep(5)  # Check every 5 seconds
+
 if __name__ == "__main__":
     try:
         print(json.dumps({"type": "ready"})+'\n')
@@ -347,6 +360,9 @@ if __name__ == "__main__":
                     config = update_config(config, data["config"])
                 if data.get("type") == "change_event_config":
                     config = update_event_config(config, data["section"], data["event"], data["value"])
+                if data.get("type") == "clear_history":
+                    EventManager.clear_history()
+                    #ActionManager.clear_action_cache()
                 
             except json.JSONDecodeError:
                 continue
@@ -359,6 +375,10 @@ if __name__ == "__main__":
         # run chat in a thread
         stdin_thread = threading.Thread(target=read_stdin, args=(chat,), daemon=True)
         stdin_thread.start()
+
+        if sys.platform.startswith('linux'):
+            zombie_check_thread = threading.Thread(target=check_zombie_status, daemon=True)
+            zombie_check_thread.start()
 
         log("debug", "Running chat...")
         chat.run()

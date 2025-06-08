@@ -1983,10 +1983,12 @@ class PromptGenerator:
             return f"No active Community Goals found."
 
         if event_name == 'CrimeVictim':
-            crime_victim_event = cast(Dict[str, Any], content)
-            offender = crime_victim_event.get('Offender', 'Unknown perpetrator')
-            crime_type = crime_victim_event.get('CrimeType', 'unknown crime')
-            return f"{self.commander_name} has been the victim of {crime_type} by {offender}."
+            # @ToDo: Filter only if offender isn't commander
+            # crime_victim_event = cast(Dict[str, Any], content)
+            # offender = crime_victim_event.get('Offender', 'Unknown perpetrator')
+            # crime_type = crime_victim_event.get('CrimeType', 'unknown crime')
+            # return f"{self.commander_name} has been the victim of {crime_type} by {offender}."
+            return None
 
         if event_name == 'Died':
             died_event = cast(DiedEvent, content)
@@ -2101,17 +2103,6 @@ class PromptGenerator:
 
             return f"{self.commander_name}'s game statistics have been reported:\n{yaml.dump(content)}"
 
-        if event_name == 'Trade':
-            trade_event = cast(Dict[str, Any], content)
-            commodity = trade_event.get('Type_Localised', trade_event.get('Type', 'goods'))
-            count = trade_event.get('Count', 0)
-            price_per_unit = trade_event.get('Price', 0)
-            total_profit = trade_event.get('TotalProfit', 0)
-            if trade_event.get('SellPrice'):
-                return f"{self.commander_name} has sold {count} units of {commodity} at {price_per_unit:,} credits each (Total profit: {total_profit:,} credits)."
-            else:
-                return f"{self.commander_name} has purchased {count} units of {commodity} at {price_per_unit:,} credits each."
-
         if event_name == 'WeaponSelected':
             weapon_event = cast(Dict[str, Any], content)
             weapon = weapon_event.get('Weapon_Localised', weapon_event.get('Weapon', 'unknown weapon'))
@@ -2172,6 +2163,9 @@ class PromptGenerator:
 
         if event_name == "DockingComputerDeactivated":
             return f"{self.commander_name}'s ship has deactivated the docking computer"
+
+        if event_name == "Market":
+            return None
 
         log('debug', f'fallback for event', event_name, content)
 
@@ -2247,6 +2241,8 @@ class PromptGenerator:
             return 'Warning: Fuel reserves critically low, refueling recommended'
         if event_name == 'FsdCharging':
             return 'Frame Shift Drive charging, preparing for jump'
+        if event_name == "BeingInterdicted":
+            return "Supercruise is being interdicted."
         if event_name == 'SrvHandbrakeOff':
             return 'SRV handbrake released, free to move'
         if event_name == 'SrvHandbrakeOn':
@@ -2473,8 +2469,13 @@ class PromptGenerator:
         if in_combat.get("InCombat", False):
             flags.append("InCombat")
 
+        firegroup = "Unknown"
+        if current_status.get("FireGroup") is not None:
+            firegroup = chr(65 + current_status.get("FireGroup"))
+
         status_info = {
             "status": flags,
+            "current fire_group": firegroup,
             "balance": current_status.get("Balance", None),
             "pips": current_status.get("Pips", None),
             "cargo": current_status.get("Cargo", None),
@@ -2785,20 +2786,37 @@ class PromptGenerator:
         outfitting = projected_states.get('Outfitting', {})
         storedShips = projected_states.get('StoredShips', {})
         if current_station and current_station == market.get('StationName'):
-            status_entries.append(("Local market information", {
+            buy_items = {
                 item.get('Name_Localised'): {
                     'Category': item.get('Category_Localised'),
                     'BuyPrice': item.get('BuyPrice'),
                     'MeanPrice': item.get('MeanPrice'),
                     'Stock': item.get('Stock'),
-                } if item.get('Stock') > item.get('Demand') else {
+                }
+                for item in market.get('Items', [])
+                if item.get('Stock', 0) > item.get('Demand', 0)
+            }
+
+            sell_items = {
+                item.get('Name_Localised'): {
                     'Category': item.get('Category_Localised'),
                     'SellPrice': item.get('SellPrice'),
                     'MeanPrice': item.get('MeanPrice'),
                     'Demand': item.get('Demand'),
                 }
-                for item in market.get('Items',[]) if item.get('Stock') or item.get('Demand')
-            }))
+                for item in market.get('Items', [])
+                if item.get('Demand', 0) > item.get('Stock', 0)
+            }
+
+            if buy_items or sell_items:
+                status_entries.append((
+                    "Local market information",
+                    {
+                        "List of goods I can buy from the market": buy_items,
+                        "List of Goods I can sell to the market": sell_items
+                    }
+                ))
+
         if current_station and current_station == outfitting.get('StationName'):
             # Create a nested structure from outfitting items with optimized leaf nodes
             nested_outfitting = {}
@@ -3076,8 +3094,9 @@ class PromptGenerator:
                     "content": "The universe of Elite:Dangerous is your reality. Never mention it or refer to it as a game. "
                     + "Your purpose is to provide information, status updates, and execute tools as required. Only use tools you are given from me. "
                     + "You do not ask questions or initiate conversations. You respond only when addressed and in a single sentence. "
+                    + "Don't repeat the same words and sentences, mix it up. "
                     + "I will provide game events in parentheses; do not create new ones. Only react to game events marked with 'IMPORTANT:'.  "
-                    + "Stay consistent with the lived experience. Do not hallucinate any information that is not given to you. "
+                    + "Stay consistent with the lived experience and character. Do not hallucinate any information that is not given to you. "
                     + "Do not use markdown in your responses. "
                     # The character_prompt now contains all the generated settings
                     + self.character_prompt.format(commander_name=self.commander_name),

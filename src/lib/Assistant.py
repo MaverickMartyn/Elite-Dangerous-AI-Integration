@@ -1,3 +1,5 @@
+import json
+import traceback
 from openai.types.chat import ChatCompletion
 from time import time
 
@@ -9,8 +11,8 @@ from .ActionManager import ActionManager
 from .PromptGenerator import PromptGenerator
 from .TTS import TTS
 from .EDCoPilot import EDCoPilot
-from openai import OpenAI
-from typing import Any, Callable, final
+from openai import APIStatusError, BadRequestError, OpenAI, RateLimitError
+from typing import Any,  Callable, final
 from threading import Thread
 
 @final
@@ -25,7 +27,6 @@ class Assistant:
         self.prompt_generator = prompt_generator
         self.copilot = copilot
         self.is_replying = False
-        self.is_thinking = False
         self.reply_pending = False
         self.pending: list[Event] = []
         self.registered_should_reply_handlers: list[Callable[[Event, dict[str, Any]], bool | None]] = []
@@ -72,85 +73,123 @@ class Assistant:
 
 
     def reply(self, events: list[Event], projected_states: dict[str, dict]):
+        if self.is_replying:
+            log('debug', 'Reply already in progress, skipping new reply')
+            return
         thread = Thread(target=self.reply_thread, args=(events, projected_states), daemon=True)
         thread.start()
         
         
     def reply_thread(self, events: list[Event], projected_states: dict[str, dict]):
-        self.is_thinking = True
         self.reply_pending = False
-        new_events = self.pending.copy()
-        self.pending = []
-        
-        log('debug', 'Starting reply...')
-        prompt = self.prompt_generator.generate_prompt(events=events, projected_states=projected_states, pending_events=new_events)
-
-        user_input: list[str] = [event.content for event in new_events if event.kind == 'user']
-        use_tools = self.config["tools_var"] and len(user_input)
-        reasons = [event.content.get('event', event.kind) if event.kind=='game' else event.kind for event in new_events if event.kind in ['user', 'game', 'tool', 'status']]
-
-        current_status = projected_states.get("CurrentStatus")
-        flags = current_status["flags"]
-        flags2 = current_status["flags2"]
-
-        active_mode = None
-        if flags:
-            if flags["InMainShip"]:
-                active_mode = "mainship"
-            elif flags["InFighter"]:
-                active_mode = "fighter"
-            elif flags["InSRV"]:
-                active_mode = "buggy"
-        if flags2:
-            if flags2["OnFoot"]:
-                active_mode = "humanoid"
-
-        uses_actions = self.config["game_actions_var"]
-        uses_web_actions = self.config["web_search_actions_var"]
-        tool_list = self.action_manager.getToolsList(active_mode, uses_actions, uses_web_actions) if use_tools else None
-        predicted_actions = None
-        if tool_list and user_input:
-            predicted_actions = self.action_manager.predict_action(user_input, tool_list)
+        self.is_replying = True
+        try:
+            new_events = self.pending.copy()
+            self.pending = []
             
-        if predicted_actions:
-            #log('info', 'predicted_actions', predicted_actions)
-            response_text = None
-            response_actions = predicted_actions
-        else:
-            start_time = time()
-            completion = self.llmClient.chat.completions.create(
-                model=self.config["llm_model_name"],
-                messages=prompt,
-                temperature=0,
-                tools=tool_list
-            )
-            end_time = time()
-            log('debug', 'Response time LLM', end_time - start_time)
+            log('debug', 'Starting reply...')
+            prompt = self.prompt_generator.generate_prompt(events=events, projected_states=projected_states, pending_events=new_events)
 
-            if not isinstance(completion, ChatCompletion) or hasattr(completion, 'error'):
-                log("error", "completion with error:", completion)
-                self.is_thinking = False
-                return
-            if hasattr(completion, 'usage') and completion.usage:
-                log("debug", f'Prompt: {completion.usage.prompt_tokens}, Completion: {completion.usage.completion_tokens}')
+            user_input: list[str] = [event.content for event in new_events if event.kind == 'user']
+            use_tools = self.config["tools_var"] and len(user_input)
+            reasons = [event.content.get('event', event.kind) if event.kind=='game' else event.kind for event in new_events if event.kind in ['user', 'game', 'tool', 'status']]
 
-            response_text = completion.choices[0].message.content
-            response_actions = completion.choices[0].message.tool_calls
+            current_status = projected_states.get("CurrentStatus")
+            flags = current_status["flags"]
+            flags2 = current_status["flags2"]
 
-        if response_text and not response_actions:
-            self.tts.say(response_text)
-            self.event_manager.add_conversation_event('assistant', completion.choices[0].message.content)
-            self.copilot.output_covas(response_text, reasons)
+            active_mode = None
+            if flags:
+                if flags["InMainShip"]:
+                    active_mode = "mainship"
+                elif flags["InFighter"]:
+                    active_mode = "fighter"
+                elif flags["InSRV"]:
+                    active_mode = "buggy"
+            if flags2:
+                if flags2["OnFoot"]:
+                    active_mode = "humanoid"
 
-        self.is_thinking = False
+            uses_actions = self.config["game_actions_var"]
+            uses_web_actions = self.config["web_search_actions_var"]
+            tool_list = self.action_manager.getToolsList(active_mode, uses_actions, uses_web_actions) if use_tools else None
+            predicted_actions = None
+            if tool_list and user_input:
+                predicted_actions = self.action_manager.predict_action(user_input, tool_list)
+                
+            if predicted_actions:
+                #log('info', 'predicted_actions', predicted_actions)
+                response_text = None
+                response_actions = predicted_actions
+            else:
+                start_time = time()
+                try:
+                    response = self.llmClient.chat.completions.with_raw_response.create(
+                        model=self.config["llm_model_name"],
+                        messages=prompt,
+                        temperature=0,
+                        tools=tool_list
+                    )
+                    end_time = time()
+                    log('debug', 'Response time LLM', end_time - start_time)
+                except APIStatusError as e:
+                    log("debug", "LLM error request:", e.request.method, e.request.url, e.request.headers, e.request.content.decode('utf-8', errors='replace'))
+                    log("debug", "LLM error response:", e.response.status_code, e.response.headers, e.response.content.decode('utf-8', errors='replace'))
+                    
+                    try:
+                        error: dict = e.body[0] if hasattr(e, 'body') and e.body and isinstance(e.body, list) else e.body # pyright: ignore[reportAssignmentType]
+                        message = error.get('error', {}).get('message', e.body if e.body else 'Unknown error')
+                    except:
+                        message = e.message
+                    
+                    log('error', f'LLM {e.response.reason_phrase}:', message)
+                    return
+                
+                completion = response.parse()
+                
+                if not isinstance(completion, ChatCompletion) or hasattr(completion, 'error'):
+                    log("debug", "LLM completion error request:", response.http_request.method, response.http_request.url, response.http_request.headers, response.http_request.content.decode('utf-8', errors='replace'))
+                    log("debug", "LLM completion error:", completion)
+                    log("error", "LLM error: No valid completion received")
+                    return
+                if not completion.choices:
+                    log("debug", "LLM completion has no choices:", completion)
+                    log("error", "LLM error: No valid response choices received")
+                    return
+                if not hasattr(completion.choices[0], 'message') or not completion.choices[0].message:
+                    log("debug", "LLM completion choice has no message:", completion)
+                    log("error", "LLM error: No valid response message received")
+                    return
+                
+                if hasattr(completion, 'usage') and completion.usage:
+                    log("debug", f'LLM completion usage', completion.usage)
+                
+                if hasattr(completion.choices[0].message, 'content'):
+                    response_text = completion.choices[0].message.content
+                else:
+                    log("debug", f'LLM completion without text')
+                    response_text = None
 
+                if hasattr(completion.choices[0].message, 'tool_calls'):
+                    response_actions = completion.choices[0].message.tool_calls
+                else:
+                    response_actions = None
 
-        if response_actions:
-            self.execute_actions(response_actions, projected_states)
+            if response_text and not response_actions:
+                self.tts.say(response_text)
+                self.event_manager.add_conversation_event('assistant', completion.choices[0].message.content)
+                self.copilot.output_covas(response_text, reasons)
 
-            if not predicted_actions and self.config["use_action_cache_var"]:
-                self.verify_action(user_input, response_actions, prompt, tool_list)
+            if response_actions:
+                self.execute_actions(response_actions, projected_states)
 
+                if not predicted_actions and self.config["use_action_cache_var"]:
+                    self.verify_action(user_input, response_actions, prompt, tool_list)
+        except Exception as e:
+            log("debug", "LLM error during reply:", e, traceback.format_exc())
+            log("error", "LLM error: An unknown error occurred during reply")
+        finally:
+            self.is_replying = False
 
     def should_reply(self, states:dict[str, Any]):
         character = self.config['characters'][self.config['active_character_index']]

@@ -3,7 +3,8 @@ import platform
 import threading
 from time import sleep
 import traceback
-from typing import Optional
+import math
+from typing import Any, Literal, Optional
 from pyautogui import typewrite
 from datetime import datetime, timezone
 
@@ -37,7 +38,7 @@ def checkStatus(projected_states: dict[str, dict], blocked_status_dict: dict[str
 # Define functions for each action
 # General Ship Actions
 def fire_weapons(args, projected_states):
-    checkStatus(projected_states, {'Docked':True,'Landed':True,'HudInAnalysisMode':True})
+    checkStatus(projected_states, {'Docked':True,'Landed':True})
     setGameWindowActive()
 
     # Parse arguments with defaults
@@ -47,6 +48,13 @@ def fire_weapons(args, projected_states):
     repetitions = args.get('repetitions', 0)  # 0 = one action, 1+ = repeat
 
     # Determine key mapping
+    if weapon_type == 'discovery_scanner':
+        change_hud_mode({'hud mode': 'analysis'}, projected_states)
+        cycle_fire_group({'fire_group': 0}, projected_states)
+        keys.send('PrimaryFire', hold=6)
+        return 'Discovery scan has been performed.'
+
+    change_hud_mode({'hud mode': 'combat'}, projected_states)
     if weapon_type == 'secondary':
         key_name = 'SecondaryFire'
         weapon_desc = 'secondary weapons'
@@ -194,16 +202,43 @@ def change_hud_mode(args, projected_states):
 
 def cycle_fire_group(args, projected_states):
     setGameWindowActive()
+    firegroup_ask = args.get('fire_group')
 
-    direction = args.get('direction', 'next').lower()
+    initial_firegroup = projected_states.get("CurrentStatus").get('FireGroup')
 
-    if direction == 'previous':
-        keys.send('CycleFireGroupPrevious')
-        return "Cycled to previous fire group"
+    if firegroup_ask is None:
+        direction = args.get('direction', 'next').lower()
+
+        if direction == 'previous':
+            keys.send('CycleFireGroupPrevious')
+            return "Previous fire group selected."
+        else:
+            keys.send('CycleFireGroupNext')
+            return "Next fire group selected."
+
+
+    elif firegroup_ask == initial_firegroup:
+        return f"Fire group {chr(65 + firegroup_ask)} was already selected. No changes."
+    elif firegroup_ask > 7:   # max allowed is up to H which is 7 starting with A=0
+        return f"Cannot switch to Firegroup {firegroup_ask} as it does not exist."
     else:
-        # Default to 'next' for any invalid direction
-        keys.send('CycleFireGroupNext')
-        return "Cycled to next fire group"
+        for loop in range(abs(firegroup_ask - initial_firegroup)):
+            if firegroup_ask > initial_firegroup:
+                keys.send("CycleFireGroupNext")
+            else:
+                keys.send("CycleFireGroupPrevious")
+
+    try:
+
+        status_event = event_manager.wait_for_condition('CurrentStatus',
+                                                            lambda s: s.get('FireGroup') == firegroup_ask, 2)
+        new_firegroup = status_event["FireGroup"]
+    except TimeoutError:
+        #handles case where we cycle back round to zero
+        return "Failed to cycle to requested fire group. Please ensure it exists."
+
+    return f"Fire group {chr(65 + new_firegroup)} is now selected."
+
 
 def ship_spot_light_toggle(args, projected_states):
     setGameWindowActive()
@@ -237,10 +272,88 @@ def charge_ecm(args, projected_states):
     return "ECM is attempting to charge"
 
 
+def calculate_navigation_distance_and_timing(current_system: str, target_system: str) -> tuple[float, int]:
+    distance_ly = 0.0  # Default value in case API call fails
+    
+    if current_system != 'Unknown' and target_system:
+        try:
+            # Request coordinates for both systems from EDSM API
+            edsm_url = "https://www.edsm.net/api-v1/systems"
+            params = {
+                'systemName[]': [current_system, target_system],
+                'showCoordinates': 1
+            }
+            
+            log('debug', 'Distance Calculation', f"Requesting coordinates for {current_system} -> {target_system}")
+            response = requests.get(edsm_url, params=params, timeout=5)
+            
+            if response.status_code == 200:
+                systems_data = response.json()
+                
+                if len(systems_data) >= 2:
+                    # Find the systems in the response
+                    current_coords = None
+                    target_coords = None
+                    
+                    for system in systems_data:
+                        if system.get('name', '').lower() == current_system.lower():
+                            current_coords = system.get('coords')
+                        elif system.get('name', '').lower() == target_system.lower():
+                            target_coords = system.get('coords')
+                    
+                    # Calculate distance if both coordinate sets are available
+                    if current_coords and target_coords:
+                        x1, y1, z1 = current_coords['x'], current_coords['y'], current_coords['z']
+                        x2, y2, z2 = target_coords['x'], target_coords['y'], target_coords['z']
+                        
+                        distance_ly = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
+                        distance_ly = round(distance_ly, 2)
+                        
+                        # Check if distance is too far to plot
+                        if distance_ly > 20000:
+                            raise Exception(f"Distance of {distance_ly} LY from {current_system} to {target_system} is too far to plot (max 20000 LY)")
+                    else:
+                        log('warn', 'Distance Calculation', f"Could not find coordinates for one or both systems: {current_system}, {target_system}")
+                else:
+                    log('warn', 'Distance Calculation', f"EDSM API returned insufficient data for systems: {current_system}, {target_system}")
+            else:
+                log('warn', 'Distance Calculation', f"EDSM API request failed with status {response.status_code}")
+                
+        except requests.RequestException as e:
+            log('error', 'Distance Calculation', f"Failed to request system coordinates from EDSM API: {str(e)}")
+        except Exception as e:
+            # Re-raise if it's our distance check exception
+            if "too far to plot" in str(e):
+                raise
+            log('error', 'Distance Calculation', f"Unexpected error during distance calculation: {str(e)}")
+    
+    # Determine wait time based on distance
+    zoom_wait_time = 3
+    
+    # Add additional second for every 1000 LY
+    if distance_ly > 0:
+        additional_time = int(distance_ly / 1000)
+        zoom_wait_time += additional_time
+    
+    # Add additional 2 seconds if distance couldn't be determined (still 0)
+    if distance_ly == 0:
+        zoom_wait_time += 2
+        log('warn', 'Navigation Timing', f"Distance could not be determined, adding 2 extra seconds to wait time")
+        
+    return distance_ly, zoom_wait_time
+
+
 def galaxy_map_open(args, projected_states, galaxymap_key="GalaxyMapOpen"):
     # Trigger the GUI open
     setGameWindowActive()
     current_gui = projected_states.get('CurrentStatus', {}).get('GuiFocus', '')
+
+
+
+    if 'start_navigation' in args and args['start_navigation']:
+        nav_route = projected_states.get('NavInfo', {}).get('NavRoute', [])
+        if nav_route and nav_route[-1].get('StarSystem') == args.get('system_name'):
+            return f"The route to {args['system_name']} is already set"
 
     if current_gui in ['SAA', 'FSS', 'Codex']:
         raise Exception('Galaxy map can not be opened currently, the active GUI needs to be closed first')
@@ -253,7 +366,7 @@ def galaxy_map_open(args, projected_states, galaxymap_key="GalaxyMapOpen"):
 
     try:
         event_manager.wait_for_condition('CurrentStatus', lambda s: s.get('GuiFocus') == "GalaxyMap", 4)
-        gm_open = True
+
     except TimeoutError:
         keys.send("UI_Back", repeat=10, repeat_delay=0.05)
         keys.send(galaxymap_key)
@@ -280,7 +393,7 @@ def galaxy_map_open(args, projected_states, galaxymap_key="GalaxyMapOpen"):
                 "Unable to enter system name due to a collision between the 'UI Panel Right' and 'Galaxy Cam Translate Right' keys. "
                 + "Please change the keybinding for 'Galaxy Cam Translate' to Shift + WASD under General Controls > Galaxy Map.")
 
-        keys.send('CamZoomOut')
+        keys.send('CamZoomIn')
         sleep(0.05)
 
         keys.send('UI_Up')
@@ -308,19 +421,34 @@ def galaxy_map_open(args, projected_states, galaxymap_key="GalaxyMapOpen"):
         keys.send('UI_Right')
         sleep(.5)
         keys.send('UI_Select')
-        sleep(.5)
 
         if 'start_navigation' in args and args['start_navigation']:
+            # Get current location from projected states and calculate distance/timing
+            current_system = projected_states.get('Location', {}).get('StarSystem', 'Unknown')
+            target_system = args['system_name']
+            
+            distance_ly, zoom_wait_time = calculate_navigation_distance_and_timing(current_system, target_system)
+            log('info', 'zoom_wait_time', zoom_wait_time)
+            # Continue with the navigation logic
+            sleep(0.05)
             keys.send('CamZoomOut')
-            sleep(0.15)
-            keys.send('UI_Select', hold=0.75)
+            sleep(zoom_wait_time)
+            keys.send('UI_Select', hold=1)
 
             sleep(0.05)
-            if not current_gui == "GalaxyMap":  # if we are already in the galaxy map we don't want to close it
-                keys.send(galaxymap_key)
 
-            return ((f"Best location found: {json.dumps(args['details'])}. " if 'details' in args else '') +
-                    f"Plotting a route to {args['system_name']} has been attempted. Check event history to see if it was successful, if you see no event it has failed.")
+            try:
+                data = event_manager.wait_for_condition('NavInfo',
+                                                                     lambda s: s.get('NavRoute') and len(s.get('NavRoute', [])) > 0 and s.get('NavRoute')[-1].get('StarSystem').lower() == args['system_name'].lower(), zoom_wait_time)
+                jumpAmount = len(data.get('NavRoute', []))  # amount of jumps to do
+
+                if not current_gui == "GalaxyMap":  # if we are already in the galaxy map we don't want to close it
+                    keys.send(galaxymap_key)
+
+                return (f"Best location found: {json.dumps(args['details'])}. " if 'details' in args else '') + f"Route to {args['system_name']} successfully plotted ({f"Distance: {distance_ly} LY, " if distance_ly > 0 else ""}Jumps: {jumpAmount})"
+
+            except TimeoutError:
+                return f"Failed to plot a route to {args['system_name']}"
 
         return f"The galaxy map has opened. It is now zoomed in on \"{args['system_name']}\". No route was plotted yet, only the commander can do that."
 
@@ -435,7 +563,7 @@ def fsd_jump(args, projected_states):
 def next_system_in_route(args, projected_states):
     nav_info = projected_states.get('NavInfo', {})
     if not nav_info['NextJumpTarget']:
-        return "a target next system in route as no navigation route is currently set set"
+        return "cannot target next system in route as no navigation route is currently set"
 
     keys.send('TargetNextRouteSystem')
     return "Targeting next system in route"
@@ -725,7 +853,7 @@ def recall_dismiss_ship_buggy(args, projected_states):
     keys.send('RecallDismissShip')
     return "Remote ship has been recalled or dismissed."
 
-def galaxy_map_open_buggy(args, projected_states):
+def galaxy_map_open_buggy(args, projected_states) -> Any | Literal['Galaxy map is already closed', 'Galaxy map closed']:
     setGameWindowActive()
     if args['desired_state'] == "open":
         response = galaxy_map_open(args, projected_states, "GalaxyMapOpen_Buggy")
@@ -1862,7 +1990,7 @@ def station_finder(obj,projected_states):
 
     url = "https://spansh.co.uk/api/stations/search"
     try:
-        response = requests.post(url, json=request_body)
+        response = requests.post(url, json=request_body, timeout=15)
         response.raise_for_status()  # Raises an HTTPError for bad responses (4xx and 5xx)
 
         data = response.json()
@@ -2084,7 +2212,7 @@ def system_finder(obj, projected_states):
     url = "https://spansh.co.uk/api/systems/search"
 
     try:
-        response = requests.post(url, json=request_body)
+        response = requests.post(url, json=request_body, timeout=15)
         response.raise_for_status()
 
         data = response.json()
@@ -2750,7 +2878,7 @@ def body_finder(obj,projected_states):
     url = "https://spansh.co.uk/api/bodies/search"
 
     try:
-        response = requests.post(url, json=request_body)
+        response = requests.post(url, json=request_body, timeout=15)
         response.raise_for_status()
 
         data = response.json()
@@ -2825,7 +2953,8 @@ def register_actions(actionManager: ActionManager, eventManager: EventManager, l
             "description": "Type of weapons to fire",
             "enum": [
               "primary",
-              "secondary"
+              "secondary",
+              "discovery_scanner"
             ],
             "default": "primary"
           },
@@ -2962,6 +3091,29 @@ def register_actions(actionManager: ActionManager, eventManager: EventManager, l
         }
     }, cycle_target, 'ship')
 
+
+    actionManager.registerAction(
+        'cycle_fire_group',
+        "call this tool if the user asks to cycle, select or switch to specific firegroup, the the next firegroup or to the previous firegroup",
+        {
+            "type": "object",
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "description": "If next or previous is give: Cycle direction: 'next' or 'previous'.",
+                    "enum": ["next", "previous"]
+                },
+                "fire_group": {
+                    "type": "integer",
+                    "description": "Specific firegroup index to select. Letters A=0, B=1, C=2, etc.",
+                    "default": None
+                }
+            },
+        },
+        cycle_fire_group,
+        'mainship'
+    )
+
     actionManager.registerAction('Change_ship_HUD_mode', "Switch to combat or analysis mode", {
         "type": "object",
         "properties": {
@@ -2984,6 +3136,8 @@ def register_actions(actionManager: ActionManager, eventManager: EventManager, l
             }
         }
     }, cycle_fire_group, 'ship')
+
+    
 
 
     actionManager.registerAction('shipSpotLightToggle', "Toggle ship spotlight", {
@@ -3141,8 +3295,8 @@ def register_actions(actionManager: ActionManager, eventManager: EventManager, l
             "duration": {
                 "type": "number",
                 "description": "Duration to hold fire button in seconds (for fire action only)",
-                "minimum": 0.1,
-                "maximum": 30.0
+                "minimum": 0,
+                "maximum": 30
             },
             "repetitions": {
                 "type": "integer",
